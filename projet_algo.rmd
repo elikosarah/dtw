@@ -212,13 +212,168 @@ res$pente
 
 ```{r}
 # C++
-res <- simulation_dtw_rcpp(debut = 100, fin = 500, pas = 10)
+res <- simulation_dtw_rcpp(debut = 1000, fin = 5000, pas = 10)
 res$pente
 ```
 
 Finalement, nous constatons que le temps d’exécution de l’algorithme en R et en C++ n’est pas du même ordre de grandeur: pour une série de taille 500, le programme en R prend 0,1 seconde, tandis que celui en C++ ne prend que 0,005 seconde.
 
+Exmeple d'utilisaton pour la classification :
+```{r}
 
+#install.packages("class")   # pour kNN
+#install.packages("readr")   # pratique pour lire des fichiers si besoin
+
+library(class)
+library(readr)
+
+```
+
+```{r}
+# installer si besoin
+# install.packages("devtools")
+library("devtools")
+devtools::install_github("moviedo5/fda.tsc")
+
+library(fda.tsc)
+
+data(ECG5000)
+# Le dataset est chargé : 
+# - ECG5000$x  contient les séries (5000 × 140)  
+# - ECG5000$class  contient les classes  
+# - ECG5000$sample indique train vs test  
+
+str(ECG5000)
+# Séries et labels
+library(fda.tsc)
+
+# Séries et labels
+X_all <- ECG5000$x$data        # matrice 5000 x 140
+y_all <- as.numeric(ECG5000$df$class)  # 1 à 5
+sample_all <- ECG5000$df$sample       # "train" / "test"
+
+# Transformer en data.frame
+df_all <- data.frame(X_all)     # colonnes att0 à att139
+df_all$class <- y_all           # colonne de labels
+df_all$sample <- sample_all     # optionnel : train/test
+
+# Vérification
+head(df_all)
+dim(df_all)  # 5000 x 142
+
+# Séparer train/test si nécessaire
+df_train <- df_all[df_all$sample == "train", ]
+df_test  <- df_all[df_all$sample == "test", ]
+
+
+# Retirer la colonne sample si tu veux juste séries + labels
+df_train$sample <- NULL
+df_test$sample  <- NULL
+
+# Vérification
+dim(df_train)  # ex: 4500 x 141
+dim(df_test)   # ex: 500 x 141
+
+
+# Séparer train et test
+X_train <- as.matrix(df_test[, -ncol(df_test)])   # 4500 x 140
+y_train <- df_test$class
+
+X_test  <- as.matrix(df_train[, -ncol(df_train)]) # 500 x 140
+y_test  <- df_train$class
+
+
+dim(X_train)  # 4500 x 140
+dim(X_test)   # 500 x 140
+length(y_train)  # 4500
+length(y_test)   # 500
+
+
+```
+
+```{r}
+dtw_distance <- function(x, y) {
+  result <- dtw_cpp(x, y)
+  return(result$DTW_matrix[length(x), length(y)])
+}
+
+```
+
+
+```{r}
+
+
+# Paramètres
+k <- 5
+n_train <- nrow(X_train)
+n_test  <- nrow(X_test)
+predictions <- numeric(n_test)
+
+# k-NN avec DTW
+for(i in 1:n_test){
+  distances <- numeric(n_train)
+  
+  for(j in 1:n_train){
+    distances[j] <- dtw_distance(as.numeric(X_test[i,]), as.numeric(X_train[j,]))
+  }
+  
+  # Indices des k plus proches voisins
+  nn_idx <- order(distances)[1:k]
+  
+  # Classes des k plus proches voisins
+  nn_classes <- y_train[nn_idx]
+  
+  # Vote majoritaire
+  pred_class <- as.numeric(names(sort(table(nn_classes), decreasing = TRUE)[1]))
+  predictions[i] <- pred_class
+  
+  if(i %% 50 == 0) cat("Test series", i, "done\n")
+}
+
+# Évaluer la précision
+accuracy <- sum(predictions == y_test) / length(y_test)
+cat("Accuracy:", accuracy, "\n")
+
+conf_matrix <- table(Predicted = predictions, Actual = y_test)
+print(conf_matrix)
+
+classes <- sort(unique(c(y_train, y_test)))  # toutes les classes possibles
+conf_mat <- table(factor(predictions, levels = classes),
+                  factor(y_test, levels = classes))
+print(conf_mat)
+
+unique(y_train)
+unique(y_test)
+
+conf_matrix <- table(
+  Predicted = factor(predictions, levels = 1:5),
+  Actual    = factor(y_test, levels = 1:5)
+)
+print(conf_matrix)
+
+```
+
+
+```{r}
+# Accuracy sur le train
+train_predictions <- numeric(n_train)
+for(i in 1:n_train){
+  distances <- numeric(n_train)
+  for(j in 1:n_train){
+    distances[j] <- dtw_distance(as.numeric(X_train[i,]), as.numeric(X_train[j,]))
+  }
+  nn_idx <- order(distances)[1:k]
+  nn_classes <- y_train[nn_idx]
+  train_predictions[i] <- as.numeric(names(sort(table(nn_classes), decreasing = TRUE)[1]))
+}
+train_accuracy <- sum(train_predictions == y_train) / length(y_train)
+cat("Train Accuracy:", train_accuracy, "\n")
+
+# Accuracy sur le test
+test_accuracy <- sum(predictions == y_test) / length(y_test)
+cat("Test Accuracy:", test_accuracy, "\n")
+
+```
 
 
 
