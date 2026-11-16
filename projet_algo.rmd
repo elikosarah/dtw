@@ -205,20 +205,102 @@ théorique du DTW.
 
 ```{r}
 # R
-res <- simulation_dtw(debut = 100, fin = 500, pas = 10)
+temps_simulation <- system.time({
+res <- simulation_dtw(debut = 1000, fin = 5000, pas = 10)
 res$pente
+})
+
+# Afficher le temps total
+cat("Temps total de simulation (seconds) :", temps_simulation["elapsed"], "\n")
 
 ```
 
 ```{r}
 # C++
+temps_simulation <- system.time({
 res <- simulation_dtw_rcpp(debut = 1000, fin = 5000, pas = 10)
 res$pente
+})
+
+# Afficher le temps total
+cat("Temps total de simulation (seconds) :", temps_simulation["elapsed"], "\n")
+
 ```
 
 Finalement, nous constatons que le temps d’exécution de l’algorithme en R et en C++ n’est pas du même ordre de grandeur: pour une série de taille 500, le programme en R prend 0,1 seconde, tandis que celui en C++ ne prend que 0,005 seconde.
 
-Exmeple d'utilisaton pour la classification :
+
+```{r}
+
+superposer_dtw <- function(debut = 400, fin = 5000, pas = 50, afficher_plots = TRUE) {
+
+  # Exécuter les deux simulations sans afficher les plots
+  res_base <- simulation_dtw(debut = debut, fin = fin, pas = pas, afficher_plots = FALSE)
+  res_rcpp <- simulation_dtw_rcpp(debut = debut, fin = fin, pas = pas, afficher_plots = FALSE)
+  
+
+
+  if (afficher_plots) {
+    # --- Graphique taille vs temps avec axes adaptés ---
+    x_min <- min(res_base$resultats$Taille, res_rcpp$resultats$Taille)
+    x_max <- max(res_base$resultats$Taille, res_rcpp$resultats$Taille)
+    y_min <- min(res_base$resultats$Temps, res_rcpp$resultats$Temps)
+    y_max <- max(res_base$resultats$Temps, res_rcpp$resultats$Temps)
+
+    plot(res_base$resultats$Taille, res_base$resultats$Temps, type = "b", pch = 19, col = "blue",
+         xlab = "Taille des vecteurs (n)", ylab = "Temps d'exécution (s)",
+         main = "Comparaison des temps d'exécution DTW vs DTW RCPP",
+         xlim = c(x_min, x_max), ylim = c(y_min, y_max))
+    lines(res_rcpp$resultats$Taille, res_rcpp$resultats$Temps, type = "b", pch = 19, col = "green")
+    legend("topleft", legend = c("DTW", "DTW RCPP"), col = c("blue", "green"), pch = 19, lty = 1)
+
+    # --- Graphique log-log avec axes adaptés ---
+    log_x_min <- log(x_min)
+    log_x_max <- log(x_max)
+    log_y_min <- min(log(res_base$resultats$Temps), log(res_rcpp$resultats$Temps))
+    log_y_max <- max(log(res_base$resultats$Temps), log(res_rcpp$resultats$Temps))
+
+    plot(log(res_base$resultats$Taille), log(res_base$resultats$Temps), type = "b", pch = 19, col = "blue",
+         xlab = "log(Taille des vecteurs)", ylab = "log(Temps d'exécution)",
+         main = "Comparaison log-log DTW vs DTW RCPP",
+         xlim = c(log_x_min, log_x_max), ylim = c(log_y_min, log_y_max))
+    lines(log(res_rcpp$resultats$Taille), log(res_rcpp$resultats$Temps), type = "b", pch = 19, col = "green")
+
+    # Ajouter droites de régression
+    abline(res_base$regression, col = "blue", lwd = 2, lty = 2)
+    abline(res_rcpp$regression, col = "green", lwd = 2, lty = 2)
+
+    legend("topleft", legend = c("DTW", "DTW RCPP"), col = c("blue", "green"), pch = 19, lty = 1:2)
+  
+  }
+
+  # Retourner les résultats
+  return(list(DTW = res_base, DTW_RCPP = res_rcpp))
+}
+
+
+# Charger les fonctions nécessaires
+# simulation_dtw() et simulation_dtw_rcpp() doivent déjà être définies
+
+# Exécuter la comparaison et afficher les graphiques
+res_comparaison <- superposer_dtw(debut = 400, fin = 2000, pas = 100, afficher_plots = TRUE)
+
+# Accéder aux résultats de DTW classique
+res_comparaison$DTW$resultats
+
+# Accéder aux résultats de DTW RCPP
+res_comparaison$DTW_RCPP$resultats
+
+# Afficher la pente estimée pour chaque algorithme
+cat("Pente DTW :", res_comparaison$DTW$pente, "\n")
+cat("Pente DTW RCPP :", res_comparaison$DTW_RCPP$pente, "\n")
+
+```
+
+Nous avons observé qu’en utilisant l’implémentation DTW en R, le programme s’exécute en environ 32 minutes, tandis que l’implémentation en C++ permet de réduire ce temps à environ 2 minutes. Dans les deux cas, la pente observée est proche de 2, ce qui confirme expérimentalement la complexité théorique de l’algorithme.
+
+
+## Exmeple d'utilisaton pour la classification :
 ```{r}
 
 #install.packages("class")   # pour kNN
@@ -293,16 +375,14 @@ length(y_test)   # 500
 
 ```{r}
 dtw_distance <- function(x, y) {
-  result <- dtw_cpp(x, y)
+  result <- dtw_rcpp(x,y)
   return(result$DTW_matrix[length(x), length(y)])
 }
-
 ```
 
 
+
 ```{r}
-
-
 # Paramètres
 k <- 5
 n_train <- nrow(X_train)
@@ -342,14 +422,57 @@ conf_mat <- table(factor(predictions, levels = classes),
                   factor(y_test, levels = classes))
 print(conf_mat)
 
-unique(y_train)
-unique(y_test)
 
 conf_matrix <- table(
   Predicted = factor(predictions, levels = 1:5),
   Actual    = factor(y_test, levels = 1:5)
 )
 print(conf_matrix)
+```
+```{r}
+# Mesurer le temps d'exécution
+temps_simulation <- system.time({
+  # Paramètres
+  k <- 5
+  n_train <- nrow(X_train)
+  n_test  <- nrow(X_test)
+  predictions <- numeric(n_test)
+
+  # k-NN avec DTW
+  for(i in 1:n_test){
+    distances <- numeric(n_train)
+    
+    for(j in 1:n_train){
+      distances[j] <- dtw_distance(as.numeric(X_test[i,]), as.numeric(X_train[j,]))
+    }
+    
+    # Indices des k plus proches voisins
+    nn_idx <- order(distances)[1:k]
+    
+    # Classes des k plus proches voisins
+    nn_classes <- y_train[nn_idx]
+    
+    # Vote majoritaire
+    pred_class <- as.numeric(names(sort(table(nn_classes), decreasing = TRUE)[1]))
+    predictions[i] <- pred_class
+    
+    if(i %% 50 == 0) cat("Test series", i, "done\n")
+  }
+
+  # Évaluer la précision
+  accuracy <- sum(predictions == y_test) / length(y_test)
+  cat("Accuracy:", accuracy, "\n")
+
+  # Matrice de confusion
+  conf_matrix <- table(
+    Predicted = factor(predictions, levels = 1:5),
+    Actual    = factor(y_test, levels = 1:5)
+  )
+  print(conf_matrix)
+})
+
+# Afficher le temps total
+cat("Temps total de simulation (seconds) :", temps_simulation["elapsed"], "\n")
 
 ```
 
@@ -374,6 +497,167 @@ test_accuracy <- sum(predictions == y_test) / length(y_test)
 cat("Test Accuracy:", test_accuracy, "\n")
 
 ```
+
+
+```{r}
+# Mesurer le temps d'exécution
+temps_simulation <- system.time({
+
+  # Paramètres
+  k <- 5
+  n_train <- nrow(X_train)
+  n_test  <- nrow(X_test)
+  predictions <- numeric(n_test)
+
+  radius <- 5  # rayon de Sakoe-Chiba (tu peux modifier)
+
+  # k-NN avec DTW (Sakoe-Chiba / Rcpp)
+  for(i in 1:n_test){
+
+    distances <- numeric(n_train)
+
+    for(j in 1:n_train){
+      distances[j] <- dtw_sakoe_chiba_rcpp(
+        as.numeric(X_test[i,]),
+        as.numeric(X_train[j,]),
+        radius = radius
+      )$DTW_distance
+    }
+
+    # Indices des k plus proches voisins
+    nn_idx <- order(distances)[1:k]
+
+    # Classes des k plus proches voisins
+    nn_classes <- y_train[nn_idx]
+
+    # Vote majoritaire
+    pred_class <- as.numeric(
+      names(sort(table(nn_classes), decreasing = TRUE)[1])
+    )
+    predictions[i] <- pred_class
+
+    if(i %% 50 == 0) cat("Test series", i, "done\n")
+  }
+
+  # Évaluer la précision
+  accuracy <- sum(predictions == y_test) / length(y_test)
+  cat("Accuracy:", accuracy, "\n")
+
+  # Matrice de confusion
+  conf_matrix <- table(
+    Predicted = factor(predictions, levels = 1:5),
+    Actual    = factor(y_test, levels = 1:5)
+  )
+  print(conf_matrix)
+})
+
+# Afficher le temps total
+cat("Temps total de simulation (seconds) :", temps_simulation["elapsed"], "\n")
+
+```
+```{r}
+library(caret)  # pour la fonction createFolds
+
+# Paramètres
+k <- 5
+radius <- 5
+n_folds <- 5
+
+# Créer les folds
+folds <- createFolds(y_train, k = n_folds, list = TRUE, returnTrain = FALSE)
+
+# Stocker les résultats
+train_accuracies <- numeric(n_folds)
+test_accuracies  <- numeric(n_folds)
+
+for(f in 1:n_folds){
+  
+  cat("Fold", f, "\n")
+  
+  test_idx  <- folds[[f]]
+  train_idx <- setdiff(1:n_train, test_idx)
+  
+  X_tr <- X_train[train_idx, ]
+  y_tr <- y_train[train_idx]
+  
+  X_te <- X_train[test_idx, ]
+  y_te <- y_train[test_idx]
+  
+  n_tr <- nrow(X_tr)
+  n_te <- nrow(X_te)
+  
+  # -----------------
+  # Prédictions sur le train (exclure soi-même)
+  train_pred <- numeric(n_tr)
+  
+  for(i in 1:n_tr){
+    distances <- numeric(n_tr)
+    for(j in 1:n_tr){
+      distances[j] <- dtw_sakoe_chiba_rcpp(
+        as.numeric(X_tr[i,]),
+        as.numeric(X_tr[j,]),
+        radius = radius
+      )$DTW_distance
+    }
+    nn_idx <- order(distances)[2:(k+1)]  # exclure soi-même
+    nn_classes <- y_tr[nn_idx]
+    train_pred[i] <- as.numeric(names(sort(table(nn_classes), decreasing = TRUE)[1]))
+  }
+  
+  train_accuracies[f] <- sum(train_pred == y_tr) / n_tr
+  
+  # -----------------
+  # Prédictions sur le test
+  test_pred <- numeric(n_te)
+  
+  for(i in 1:n_te){
+    distances <- numeric(n_tr)
+    for(j in 1:n_tr){
+      distances[j] <- dtw_sakoe_chiba_rcpp(
+        as.numeric(X_te[i,]),
+        as.numeric(X_tr[j,]),
+        radius = radius
+      )$DTW_distance
+    }
+    nn_idx <- order(distances)[1:k]
+    nn_classes <- y_tr[nn_idx]
+    test_pred[i] <- as.numeric(names(sort(table(nn_classes), decreasing = TRUE)[1]))
+  }
+  
+  test_accuracies[f] <- sum(test_pred == y_te) / n_te
+  
+  cat("Train Accuracy fold", f, ":", train_accuracies[f], "\n")
+  cat("Test  Accuracy fold", f, ":", test_accuracies[f], "\n\n")
+}
+
+# Moyenne sur les folds
+cat("Train Accuracy moyenne:", mean(train_accuracies), "\n")
+cat("Test  Accuracy moyenne:", mean(test_accuracies), "\n")
+
+```
+
+
+
+
+
+```{r}
+# Indices des battements normaux
+normal_indices <- which(y_train == 1)
+
+# Exemple : prendre le premier battement normal
+idx <- normal_indices[1]
+
+# Vérifier
+y_train[idx]  # doit retourner 1
+
+# Tracer
+plot(as.numeric(X_train[idx,]), type="l", col="blue",
+     main="Exemple de battement normal",
+     xlab="Temps (points)", ylab="Amplitude")
+
+```
+
+
 
 
 
@@ -572,19 +856,6 @@ On voit conformément au résultat théorique attendu qu'on a une complexité $O
 
 
 
-
-<<<<<<< HEAD
-
-<<<<<<< HEAD
-=======
->>>>>>> b1192dc85405ea831bbfe7076b0e89f41ca173a9
-=======
-
-
-
-
-
->>>>>>> 28d2f2e (Sauvegarde des changements locaux avant rebase)
 ## Segmental DTW 
 
 
