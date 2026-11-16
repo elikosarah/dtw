@@ -1,0 +1,434 @@
+---
+title: "Classification de battements cardiaques par Dynamic Time Warping"
+subtitle: "Le DTW améliore-t-il la détection des battements anormaux ?"
+author: "Sarah Eliko"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    highlight: tango
+    latex_engine: xelatex
+geometry: margin=2.5cm
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", cache = TRUE)
+devtools::load_all(".")   # fonctions DTW du package (dtw_rcpp, dtw_sakoe_chiba_rcpp, ...)
+set.seed(42)
+```
+
+# Introduction
+
+L'électrocardiogramme (ECG) enregistre l'activité électrique du cœur battement après battement. Un enregistrement de quelques heures en contient des milliers : les relire un à un pour repérer des battements anormaux, signes possibles d'une arythmie, est long et coûteux. La **classification automatique des battements** répond à ce besoin. Chaque battement y est traité comme une courbe, c'est-à-dire une série temporelle, à laquelle on attribue une catégorie : normal, ou l'un des types de battements anormaux.
+
+Une méthode simple et interprétable pour cela est la méthode des **k plus proches voisins** (kNN) : un nouveau battement reçoit la classe majoritaire parmi les k battements connus qui lui ressemblent le plus. Tout repose alors sur la manière de mesurer cette ressemblance. La **distance euclidienne** compare les deux courbes point par point. Elle est rapide, mais un léger décalage dans le temps suffit à éloigner deux battements pourtant de même forme. Le **Dynamic Time Warping** (DTW) corrige ce défaut : il cherche le meilleur alignement entre les deux séries en autorisant des étirements et des compressions locales du temps. Il est donc, en principe, mieux adapté à des signaux physiologiques dont le rythme varie d'un battement à l'autre.
+
+Cette souplesse a un prix. Le DTW repose sur une programmation dynamique de complexité quadratique, en $O(n^2)$ pour deux séries de longueur $n$. Dans un kNN, il faut calculer cette distance entre chaque battement à classer et tous les battements de référence, soit plusieurs millions de fois. La **bande de Sakoe-Chiba** (Sakoe et Chiba, 1978) limite l'alignement à un voisinage de la diagonale, de rayon $r$, et ramène le coût à $O(n \cdot r)$. Reste à savoir si cette contrainte préserve la qualité de la classification.
+
+Nous étudions ces questions sur le jeu de données **ECG5000** de l'archive UCR des séries temporelles, issu d'un enregistrement de la base PhysioNet (*BIDMC Congestive Heart Failure Database*). Il contient 5 000 battements de 140 points, répartis en cinq classes : battements normaux et quatre types de battements anormaux. Ces classes sont très déséquilibrées : les battements normaux représentent environ 58 % des données, et la classe la plus rare moins de 0,5 %. Ce déséquilibre est central dans un contexte médical, car ce sont précisément les battements anormaux, minoritaires, qu'il importe de détecter.
+
+## Problématique
+
+> **La distance DTW permet-elle de mieux reconnaître les battements cardiaques anormaux qu'une distance euclidienne, et à quel coût de calcul ?**
+
+Nous la déclinons en quatre questions :
+
+1. **Performance** : le kNN avec DTW classe-t-il mieux les battements qu'avec la distance euclidienne ?
+2. **Classes rares** : le modèle détecte-t-il les battements anormaux minoritaires, ou seulement les battements normaux ?
+3. **Compromis qualité / temps** : la bande de Sakoe-Chiba conserve-t-elle la qualité du DTW complet pour un coût moindre, et avec quel rayon ?
+4. **Réglage** : quelles valeurs de $k$ et de $r$ retenir, choisies par validation croisée sur le seul jeu d'entraînement ?
+
+## Démarche
+
+La section 1 présente les données et le déséquilibre des classes. La section 2 décrit la méthode : le kNN, les trois distances comparées (euclidienne, DTW complet, DTW avec bande de Sakoe-Chiba) et leur implémentation en C++ via Rcpp. La section 3 règle $k$ et $r$ par validation croisée. La section 4 évalue les modèles sur le jeu de test. Comme l'accuracy globale est trompeuse sur des classes déséquilibrées, nous rapportons aussi le **rappel par classe**, l'**accuracy équilibrée** et la **matrice de confusion**, ainsi que les **temps de calcul**. Nous discutons enfin les résultats, leurs limites et les pistes d'amélioration.
+
+
+```{r preparation, eval=FALSE}
+# Préparation unique (déjà faite) : extrait ECG5000 du package fda.tsc
+# et l'enregistre dans le projet (inst/extdata/ECG5000.rds, ~3 Mo)
+# devtools::install_github("moviedo5/fda.tsc")   # si fda.tsc n'est pas installé
+library(fda.tsc)
+data(ECG5000)
+
+ecg <- list(
+  X           = unname(ECG5000$x$data),
+  classe      = factor(ECG5000$df$class, levels = 1:5),
+  echantillon = factor(ECG5000$df$sample, levels = c("train", "test"))
+)
+
+dir.create("inst/extdata", recursive = TRUE, showWarnings = FALSE)
+saveRDS(ecg, "inst/extdata/ECG5000.rds")
+```
+
+```{r donnees}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+
+ecg <- readRDS("inst/extdata/ECG5000.rds")
+
+X           <- ecg$X            # matrice 5000 x 140 : un battement par ligne
+classe      <- ecg$classe       # classe de chaque battement (1 à 5)
+echantillon <- ecg$echantillon  # découpage officiel : "train" ou "test"
+```
+
+```{r decoupage}
+est_train <- echantillon == "train"
+
+X_train <- X[est_train, ]
+y_train <- classe[est_train]
+X_test  <- X[!est_train, ]
+y_test  <- classe[!est_train]
+
+dim(X_train)   # 500 x 140
+dim(X_test)    # 4500 x 140
+```
+
+
+# Comparaison des méthodes
+
+```{r outils}
+# Toutes les distances ont la même forme : function(x, y) -> un nombre
+distances <- list(
+  "Euclidienne (référence)"    = function(x, y) sqrt(sum((x - y)^2)),
+  "DTW complet (R)"            = function(x, y) dtw(x, y)$DTW_matrix[length(x), length(y)],
+  "DTW complet (Rcpp)"         = function(x, y) dtw_rcpp(x, y)$DTW_matrix[length(x), length(y)],
+  "DTW Sakoe-Chiba r=5 (R)"    = function(x, y) dtw_sakoe_chiba(x, y, radius = 5)$DTW_matrix[length(x), length(y)],
+  "DTW Sakoe-Chiba r=5 (Rcpp)" = function(x, y) dtw_sakoe_chiba_rcpp(x, y, radius = 5)$DTW_distance
+)
+
+# Matrice des distances : une ligne par battement à classer, une colonne par battement de référence
+matrice_distances <- function(X_requete, X_reference, distance) {
+  D <- matrix(NA_real_, nrow(X_requete), nrow(X_reference))
+  for (i in seq_len(nrow(X_requete))) {
+    for (j in seq_len(nrow(X_reference))) {
+      D[i, j] <- distance(X_requete[i, ], X_reference[j, ])
+    }
+  }
+  D
+}
+
+# kNN à partir d'une matrice de distances : vote majoritaire parmi les k plus proches
+knn_predire <- function(D, y_reference, k = 5) {
+  niveaux <- levels(y_reference)
+  pred <- apply(D, 1, function(d) {
+    votes <- table(factor(y_reference[order(d)[1:k]], levels = niveaux))
+    names(votes)[which.max(votes)]
+  })
+  factor(pred, levels = niveaux)
+}
+
+# Mesures adaptées à des classes déséquilibrées
+evaluer <- function(pred, verite) {
+  rappel <- sapply(levels(verite), function(cl)
+    if (any(verite == cl)) mean(pred[verite == cl] == cl) else NA)
+  c(accuracy            = mean(pred == verite),
+    accuracy_equilibree = mean(rappel, na.rm = TRUE),
+    setNames(rappel, paste0("rappel_", levels(verite))))
+}
+```
+
+## Vitesse de chaque implémentation
+
+Les versions R sont trop lentes pour classer les 4 500 battements de test. On mesure donc
+le temps moyen d'une distance sur 30 paires tirées au hasard, puis on en déduit
+le temps qu'aurait pris le kNN complet (4 500 × 500 = 2,25 millions de distances).
+
+```{r vitesse}
+set.seed(42)
+n_paires <- 30
+i_test   <- sample(nrow(X_test),  n_paires)
+i_train  <- sample(nrow(X_train), n_paires)
+n_total  <- nrow(X_test) * nrow(X_train)
+
+vitesse <- do.call(rbind, lapply(names(distances), function(nom) {
+  f <- distances[[nom]]
+  valeurs <- numeric(n_paires)
+  temps <- system.time(
+    for (p in seq_len(n_paires)) valeurs[p] <- f(X_test[i_test[p], ], X_train[i_train[p], ])
+  )["elapsed"]
+  data.frame(methode          = nom,
+             ms_par_distance  = 1000 * temps / n_paires,
+             kNN_complet_min  = temps / n_paires * n_total / 60,
+             distance_moyenne = mean(valeurs))
+}))
+
+kable(vitesse, digits = c(0, 3, 1, 3), row.names = FALSE,
+      col.names = c("Méthode", "ms / distance", "kNN complet estimé (min)", "Distance moyenne"))
+```
+
+## Classification du jeu de test (k = 5)
+
+```{r knn}
+k <- 5
+methodes_knn <- c("Euclidienne (référence)", "DTW Sakoe-Chiba r=5 (Rcpp)", "DTW complet (Rcpp)")
+resultats <- list()
+
+# Référence naïve : toujours prédire la classe la plus fréquente du train
+t_base <- system.time({
+  classe_majoritaire <- names(which.max(table(y_train)))
+  pred <- factor(rep(classe_majoritaire, length(y_test)), levels = levels(y_test))
+})["elapsed"]
+resultats[["Classe majoritaire (référence)"]] <- c(evaluer(pred, y_test), temps_s = unname(t_base))
+
+# kNN avec chaque distance ; le temps mesuré est celui du calcul des distances
+matrices <- list()
+for (nom in methodes_knn) {
+  t <- system.time(matrices[[nom]] <- matrice_distances(X_test, X_train, distances[[nom]]))["elapsed"]
+  pred <- knn_predire(matrices[[nom]], y_train, k)
+  resultats[[nom]] <- c(evaluer(pred, y_test), temps_s = unname(t))
+}
+
+tableau <- data.frame(methode = names(resultats), do.call(rbind, resultats), row.names = NULL)
+kable(tableau, digits = 3,
+      col.names = c("Méthode", "Accuracy", "Accuracy équilibrée",
+                    paste("Rappel classe", 1:5), "Temps (s)"))
+```
+
+## Indicateurs complémentaires
+
+```{r indicateurs}
+evaluer_complet <- function(pred, verite, classe_normale = "1") {
+  M  <- table(Predit = factor(pred, levels(verite)), Reel = verite)   # matrice de confusion
+  vp <- diag(M)                                                       # bien classés par classe
+
+  rappel    <- vp / colSums(M)                                  # parmi les vrais battements de la classe, part retrouvée
+  precision <- ifelse(rowSums(M) > 0, vp / rowSums(M), NA)      # parmi les battements prédits dans la classe, part correcte
+  f1        <- ifelse(is.na(precision) | precision + rappel == 0, 0,
+                      2 * precision * rappel / (precision + rappel))
+
+  # Kappa de Cohen : accord corrigé du hasard
+  n  <- sum(M)
+  po <- sum(vp) / n
+  pe <- sum(rowSums(M) * colSums(M)) / n^2
+  kappa <- (po - pe) / (1 - pe)
+
+  # Coefficient de corrélation de Matthews (MCC) multiclasse
+  p <- rowSums(M); t <- colSums(M)
+  denom <- sqrt((n^2 - sum(p^2)) * (n^2 - sum(t^2)))
+  mcc <- if (denom == 0) 0 else (sum(vp) * n - sum(p * t)) / denom
+
+  # Vision clinique : normal (classe 1) contre anormal (classes 2 à 5)
+  anormal_reel <- verite != classe_normale
+  anormal_pred <- pred   != classe_normale
+
+  c(accuracy            = po,
+    accuracy_equilibree = mean(rappel),
+    f1_macro            = mean(f1),
+    kappa               = kappa,
+    mcc                 = mcc,
+    sensibilite         = mean(anormal_pred[anormal_reel]),     # anormaux détectés comme anormaux
+    specificite         = mean(!anormal_pred[!anormal_reel]),   # normaux reconnus comme normaux
+    setNames(precision, paste0("precision_", levels(verite))),
+    setNames(f1,        paste0("f1_",        levels(verite))))
+}
+
+# Prédictions de chaque méthode, à partir des matrices de distances déjà calculées
+predictions <- c(
+  list("Classe majoritaire (référence)" =
+         factor(rep(names(which.max(table(y_train))), length(y_test)), levels = levels(y_test))),
+  lapply(matrices, knn_predire, y_reference = y_train, k = k)
+)
+
+indicateurs <- t(sapply(predictions, evaluer_complet, verite = y_test))
+
+kable(indicateurs[, 1:7], digits = 3,
+      col.names = c("Accuracy", "Acc. équilibrée", "F1 macro", "Kappa", "MCC",
+                    "Sensibilité (anormal)", "Spécificité (anormal)"),
+      caption = "Indicateurs globaux")
+
+kable(indicateurs[, 8:17], digits = 3,
+      col.names = c(paste("Précision", 1:5), paste("F1", 1:5)),
+      caption = "Précision et F1 par classe")
+```
+
+## Matrices de confusion
+
+```{r confusion, fig.width=10, fig.height=8}
+library(ggplot2)
+
+# Tableau brut pour chaque méthode
+for (nom in names(matrices)) {
+  print(kable(table(Predit = predictions[[nom]], Reel = y_test),
+              caption = paste("Matrice de confusion —", nom)))
+}
+
+# Version graphique : chaque colonne (classe réelle) est ramenée à 100 %
+donnees_conf <- do.call(rbind, lapply(names(matrices), function(nom) {
+  M <- table(Predit = predictions[[nom]], Reel = y_test)
+  d <- as.data.frame(M)
+  d$part <- d$Freq / ave(d$Freq, d$Reel, FUN = sum)
+  d$methode <- nom
+  d
+}))
+
+ggplot(donnees_conf, aes(x = Reel, y = Predit, fill = part)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 3.5) +
+  scale_fill_gradient(low = "white", high = "steelblue", labels = scales::percent) +
+  scale_y_discrete(limits = rev) +
+  facet_wrap(~ methode) +
+  labs(x = "Classe réelle", y = "Classe prédite", fill = "Part de la\nclasse réelle",
+       title = "Matrices de confusion (kNN, k = 5)") +
+  theme_minimal()
+```
+
+## Mise en œuvre de la validation croisée
+
+Le nombre de voisins $k$ et le rayon $r$ sont des **hyperparamètres** : ils ne sont pas appris
+par le modèle, il faut les choisir. Pour cela, nous testons plusieurs combinaisons
+($k \in \{1, 3, 5, 7, 9\}$ ; $r \in \{0, 1, 2, 3, 5, 8, 12, 20\}$, ainsi que le DTW complet et
+la distance euclidienne) par **validation croisée à 5 plis sur le seul jeu d'entraînement**.
+
+Les 500 battements d'entraînement sont répartis en 5 plis **disjoints** : chaque battement
+appartient à un seul pli. Le découpage est **stratifié** : chaque pli conserve les proportions
+des cinq classes, ce qui est indispensable vu la rareté des classes 3, 4 et 5. À tour de rôle,
+chaque pli est classé en utilisant les quatre autres comme voisins possibles. Un battement n'est
+donc jamais son propre voisin. Le critère retenu est l'**accuracy équilibrée**, calculée sur
+l'ensemble de ces prédictions.
+
+Pour limiter le temps de calcul, la matrice des distances entre battements d'entraînement est
+calculée une seule fois pour chaque distance, puis réutilisée pour tous les plis et toutes les
+valeurs de $k$. Le jeu de test n'intervient qu'à la fin, pour évaluer la combinaison retenue.
+
+Deux limites sont à garder en tête. D'une part, la classe 5 ne compte que 2 battements dans le
+jeu d'entraînement : son score en validation croisée est donc très incertain. D'autre part, tous
+les battements proviennent d'un seul patient : les plis ne sont pas réellement indépendants, et
+les performances obtenues ne garantissent pas une généralisation à d'autres patients.
+
+
+
+```{r cv-outils}
+# Matrice des distances entre tous les battements d'un même ensemble.
+# La distance étant symétrique, on ne calcule que la moitié de la matrice.
+matrice_distances_sym <- function(X, distance) {
+  n <- nrow(X)
+  D <- matrix(0, n, n)
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      D[i, j] <- D[j, i] <- distance(X[i, ], X[j, ])
+    }
+  }
+  D
+}
+
+# Plis stratifiés : dans chaque classe, les battements sont répartis à tour de rôle entre les plis
+plis_stratifies <- function(y, n_plis = 5, graine = 42) {
+  set.seed(graine)
+  pli <- integer(length(y))
+  for (cl in levels(y)) {
+    idx <- which(y == cl)
+    idx <- idx[sample.int(length(idx))]          # mélange au sein de la classe
+    pli[idx] <- rep_len(1:n_plis, length(idx))
+  }
+  pli
+}
+
+# Prédictions « hors pli » : chaque battement est classé par les battements des autres plis
+predictions_cv <- function(D, y, pli, k) {
+  pred <- factor(rep(NA, length(y)), levels = levels(y))
+  for (f in sort(unique(pli))) {
+    val <- which(pli == f)   # pli mis de côté
+    app <- which(pli != f)   # plis servant de voisins
+    pred[val] <- knn_predire(D[val, app, drop = FALSE], y[app], k)
+  }
+  pred
+}
+
+accuracy_equilibree <- function(pred, verite) {
+  mean(sapply(levels(verite), function(cl) mean(pred[verite == cl] == cl)))
+}
+```
+
+```{r cv-distances}
+valeurs_k <- c(1, 3, 5, 7, 9)
+valeurs_r <- c(0, 1, 2, 3, 5, 8, 12, 20)
+
+# Distances comparées : euclidienne, Sakoe-Chiba pour chaque rayon, DTW complet
+distances_cv <- c(
+  list("Euclidienne" = function(x, y) sqrt(sum((x - y)^2))),
+  setNames(lapply(valeurs_r, function(r) {
+    force(r)
+    function(x, y) dtw_sakoe_chiba_rcpp(x, y, radius = r)$DTW_distance
+  }), paste0("Sakoe-Chiba r=", valeurs_r)),
+  list("DTW complet" = function(x, y) dtw_rcpp(x, y)$DTW_matrix[length(x), length(y)])
+)
+
+# Une seule matrice 500 x 500 par distance, réutilisée pour tous les plis et tous les k
+matrices_train <- list()
+temps_train <- c()
+for (nom in names(distances_cv)) {
+  message("Distances train x train : ", nom)
+  temps_train[nom] <- system.time(
+    matrices_train[[nom]] <- matrice_distances_sym(X_train, distances_cv[[nom]])
+  )["elapsed"]
+}
+```
+
+```{r cv-grille}
+pli <- plis_stratifies(y_train, n_plis = 5)
+table(pli, y_train)   # vérification : chaque classe est répartie entre les plis
+
+grille <- expand.grid(distance = names(distances_cv), k = valeurs_k, stringsAsFactors = FALSE)
+grille$acc_equilibree <- mapply(function(nom, k) {
+  pred <- predictions_cv(matrices_train[[nom]], y_train, pli, k)
+  accuracy_equilibree(pred, y_train)
+}, grille$distance, grille$k)
+
+# Tableau lisible : une ligne par distance, une colonne par valeur de k
+tableau_cv <- reshape(grille, idvar = "distance", timevar = "k", direction = "wide")
+names(tableau_cv) <- c("Distance", paste("k =", valeurs_k))
+tableau_cv$`Temps (s)` <- temps_train[tableau_cv$Distance]
+kable(tableau_cv, digits = 3, row.names = FALSE,
+      caption = "Accuracy équilibrée en validation croisée (5 plis, jeu d'entraînement)")
+```
+
+```{r cv-choix}
+meilleur <- grille[which.max(grille$acc_equilibree), ]
+meilleur
+```
+
+## Évaluation finale sur le jeu de test
+
+```{r evaluation-finale}
+# Les distances test x train déjà calculées sont réutilisées quand c'est possible
+correspondance <- c("Euclidienne"     = "Euclidienne (référence)",
+                    "Sakoe-Chiba r=5" = "DTW Sakoe-Chiba r=5 (Rcpp)",
+                    "DTW complet"     = "DTW complet (Rcpp)")
+
+nom_retenu <- meilleur$distance
+k_retenu   <- meilleur$k
+
+if (nom_retenu %in% names(correspondance)) {
+  D_test <- matrices[[correspondance[[nom_retenu]]]]
+} else {
+  D_test <- matrice_distances(X_test, X_train, distances_cv[[nom_retenu]])
+}
+
+pred_final <- knn_predire(D_test, y_train, k = k_retenu)
+
+avant <- evaluer_complet(knn_predire(matrices[["DTW Sakoe-Chiba r=5 (Rcpp)"]], y_train, k = 5), y_test)
+apres <- evaluer_complet(pred_final, y_test)
+comparaison <- rbind(avant, apres)
+rownames(comparaison) <- c("Avant : Sakoe-Chiba r = 5, k = 5",
+                           paste0("Après : ", nom_retenu, ", k = ", k_retenu))
+
+kable(comparaison[, c("accuracy", "accuracy_equilibree", "f1_macro", "sensibilite", "specificite")], digits = 3,
+      col.names = c("Accuracy", "Acc. équilibrée", "F1 macro",
+                    "Sensibilité (anormal)", "Spécificité (anormal)"),
+      caption = "Évaluation sur le jeu de test, avant et après réglage de k et r")
+
+kable(table(Predit = pred_final, Reel = y_test),
+      caption = paste0("Matrice de confusion — ", nom_retenu, ", k = ", k_retenu))
+```
+
+
